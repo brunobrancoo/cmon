@@ -90,7 +90,8 @@ func readSessions(titles *titleCache) []view {
 		views = append(views, view{ID: l.id, Name: name, State: effectiveState(l.s), Since: l.s.Since})
 	}
 	titles.forgetExcept(live)
-	sort.Slice(views, func(i, j int) bool { return views[i].Name < views[j].Name })
+	// newest state change first: the row with the smallest elapsed time is on top
+	sort.SliceStable(views, func(i, j int) bool { return views[i].Since > views[j].Since })
 	return views
 }
 

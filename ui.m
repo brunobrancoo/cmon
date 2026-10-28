@@ -229,13 +229,58 @@ static void placeUnderIcon(void) {
     [panel setFrame:frame display:YES];
 }
 
+// makePanel builds a fresh window around monitorView. macOS can pin a window
+// to a single desktop over time (e.g. after the displays sleep) and no flag
+// reset undoes it, only a new window joins all desktops again.
+static NSPanel *makePanel(void) {
+    NSRect frame = NSMakeRect(0, 0, kWidth, [MonitorView heightForSessions:monitorView.sessions.count
+                                                                     usage:monitorView.usage.count]);
+    NSPanel *p = [[NSPanel alloc] initWithContentRect:frame
+                                            styleMask:NSWindowStyleMaskBorderless | NSWindowStyleMaskNonactivatingPanel
+                                              backing:NSBackingStoreBuffered
+                                                defer:NO];
+    p.releasedWhenClosed = NO;
+    p.floatingPanel = YES;
+    p.level = NSStatusWindowLevel;
+    p.collectionBehavior = NSWindowCollectionBehaviorCanJoinAllSpaces |
+                           NSWindowCollectionBehaviorStationary |
+                           NSWindowCollectionBehaviorFullScreenAuxiliary;
+    p.hidesOnDeactivate = NO;
+    p.acceptsMouseMovedEvents = YES;
+    p.opaque = NO;
+    p.backgroundColor = NSColor.clearColor;
+    p.hasShadow = YES;
+    p.appearance = [NSAppearance appearanceNamed:NSAppearanceNameDarkAqua];
+
+    NSVisualEffectView *background = [[NSVisualEffectView alloc] initWithFrame:frame];
+    background.material = NSVisualEffectMaterialHUDWindow;
+    background.blendingMode = NSVisualEffectBlendingModeBehindWindow;
+    background.state = NSVisualEffectStateActive;
+    background.wantsLayer = YES;
+    background.layer.cornerRadius = 12;
+    background.layer.masksToBounds = YES;
+    p.contentView = background;
+
+    [monitorView removeFromSuperview];
+    monitorView.frame = background.bounds;
+    [background addSubview:monitorView];
+    return p;
+}
+
+static void showWindow(void) {
+    NSPanel *old = panel;
+    panel = makePanel();
+    placeUnderIcon();
+    [panel orderFrontRegardless];
+    [old orderOut:nil];
+}
+
 static void toggleWindow(void) {
     if (panel.visible) {
         [panel orderOut:nil];
         return;
     }
-    placeUnderIcon();
-    [panel orderFrontRegardless];
+    showWindow();
 }
 
 // aggregateState is the most urgent state among the sessions:
@@ -310,37 +355,18 @@ void cmon_run(void) {
         [NSApplication sharedApplication];
         [NSApp setActivationPolicy:NSApplicationActivationPolicyAccessory];
 
-        CGFloat height = [MonitorView heightForSessions:0 usage:0];
-        panel = [[NSPanel alloc] initWithContentRect:NSMakeRect(0, 0, kWidth, height)
-                                           styleMask:NSWindowStyleMaskBorderless | NSWindowStyleMaskNonactivatingPanel
-                                             backing:NSBackingStoreBuffered
-                                               defer:NO];
-        panel.floatingPanel = YES;
-        panel.level = NSStatusWindowLevel;
-        panel.collectionBehavior = NSWindowCollectionBehaviorCanJoinAllSpaces |
-                                   NSWindowCollectionBehaviorStationary |
-                                   NSWindowCollectionBehaviorFullScreenAuxiliary;
-        panel.hidesOnDeactivate = NO;
-        panel.acceptsMouseMovedEvents = YES;
-        panel.opaque = NO;
-        panel.backgroundColor = NSColor.clearColor;
-        panel.hasShadow = YES;
-        panel.appearance = [NSAppearance appearanceNamed:NSAppearanceNameDarkAqua];
-
-        NSVisualEffectView *background = [[NSVisualEffectView alloc] initWithFrame:NSMakeRect(0, 0, kWidth, height)];
-        background.material = NSVisualEffectMaterialHUDWindow;
-        background.blendingMode = NSVisualEffectBlendingModeBehindWindow;
-        background.state = NSVisualEffectStateActive;
-        background.wantsLayer = YES;
-        background.layer.cornerRadius = 12;
-        background.layer.masksToBounds = YES;
-        panel.contentView = background;
-
-        monitorView = [[MonitorView alloc] initWithFrame:background.bounds];
+        monitorView = [[MonitorView alloc] initWithFrame:NSZeroRect];
         monitorView.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
         monitorView.hoveredRow = -1;
-        [background addSubview:monitorView];
-        resizeToFit();
+        panel = makePanel();
+
+        // switching desktops with the window open: bring it along if it got pinned
+        [NSWorkspace.sharedWorkspace.notificationCenter addObserverForName:NSWorkspaceActiveSpaceDidChangeNotification
+                                                                    object:nil
+                                                                     queue:NSOperationQueue.mainQueue
+                                                                usingBlock:^(NSNotification *n) {
+                                                                    if (panel.visible && !panel.onActiveSpace) showWindow();
+                                                                }];
 
         controller = [[Controller alloc] init];
         statusItem = [NSStatusBar.systemStatusBar statusItemWithLength:NSSquareStatusItemLength];
@@ -361,25 +387,32 @@ void cmon_run(void) {
     }
 }
 
+// cmon_update and cmon_play run on Go threads, which have no autorelease pool
+// of their own: without one, every autoreleased object lives until the thread
+// exits, and Go threads never do.
 void cmon_update(const char *json) {
-    NSData *data = [NSData dataWithBytes:json length:strlen(json)];
-    NSDictionary *snap = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
-    if (![snap isKindOfClass:NSDictionary.class]) return;
-    dispatch_async(dispatch_get_main_queue(), ^{
-        id sessions = snap[@"sessions"], usage = snap[@"usage"];
-        monitorView.sessions = [sessions isKindOfClass:NSArray.class] ? sessions : @[];
-        monitorView.usage = [usage isKindOfClass:NSArray.class] ? usage : nil;
-        resizeToFit();
-        updateStatusIcon();
-        monitorView.needsDisplay = YES;
-    });
+    @autoreleasepool {
+        NSData *data = [NSData dataWithBytes:json length:strlen(json)];
+        NSDictionary *snap = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+        if (![snap isKindOfClass:NSDictionary.class]) return;
+        dispatch_async(dispatch_get_main_queue(), ^{
+            id sessions = snap[@"sessions"], usage = snap[@"usage"];
+            monitorView.sessions = [sessions isKindOfClass:NSArray.class] ? sessions : @[];
+            monitorView.usage = [usage isKindOfClass:NSArray.class] ? usage : nil;
+            resizeToFit();
+            updateStatusIcon();
+            monitorView.needsDisplay = YES;
+        });
+    }
 }
 
 void cmon_play(const char *name) {
-    NSString *sound = [NSString stringWithUTF8String:name];
-    dispatch_async(dispatch_get_main_queue(), ^{
-        NSSound *s = [NSSound soundNamed:sound];
-        [s stop];
-        [s play];
-    });
+    @autoreleasepool {
+        NSString *sound = [NSString stringWithUTF8String:name];
+        dispatch_async(dispatch_get_main_queue(), ^{
+            NSSound *s = [NSSound soundNamed:sound];
+            [s stop];
+            [s play];
+        });
+    }
 }
